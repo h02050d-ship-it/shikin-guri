@@ -677,7 +677,18 @@ function renderParams(){
   $("prTbl").querySelectorAll("input").forEach(inp=>{
     inp.onchange=()=>{ const k=inp.dataset.k, t=inp.dataset.t; const p=DB.params.find(x=>x.key===k); if(!p) return;
       let v; if(t==="率"){ v=parseFloat(inp.value.replace(/[^\d.\-]/g,""))/100; if(!isFinite(v)) return; }
-      else if(t==="数値"){ v=parseFloat(inp.value.replace(/[^\d.\-]/g,"")); if(!isFinite(v)) return; v=Math.round(v); }
+      else if(t==="数値"){
+        // 「◯万」「◯億」入りの入力は円換算を確認してから入れる（キャンセルなら元の値に戻す）
+        if(/[万億]/.test(inp.value)){
+          const raw=inp.value, num=s=>parseFloat(String(s).replace(/,/g,""));
+          const mo=raw.match(/([\d.,]+)\s*億/), mm=raw.match(/([\d.,]+)\s*万/);
+          let cv=0; if(mo&&isFinite(num(mo[1]))) cv+=num(mo[1])*1e8; if(mm&&isFinite(num(mm[1]))) cv+=num(mm[1])*1e4;
+          const tail=raw.replace(/.*[万億]/,"").replace(/[^\d]/g,""); if(tail) cv+=+tail;
+          cv=Math.round(cv);
+          if(!isFinite(cv)||!confirm(raw.trim()+"と入力されています。数値は円で入れてください（"+yen0(cv)+"円）。この円換算値を入れますか？")){ inp.value=p.value==null?"":Math.round(+p.value).toLocaleString("ja-JP"); return; }
+          inp.value=String(cv);
+        }
+        v=parseFloat(inp.value.replace(/[^\d.\-]/g,"")); if(!isFinite(v)) return; v=Math.round(v); }
       else if(t==="日付"){ v=SGCalc.normDate(inp.value); if(!v) return; }
       else v=inp.value;
       const orig=(SERVER.db.params.find(x=>x.key===k)||{}).value;
@@ -729,6 +740,15 @@ $("mOk").onclick=()=>{
   if(!expr&&amtRaw==="") { toast("金額か式のどちらかを入れてください"); return; }
   if(expr){ try{ SGCalc.evalExpr(expr,CALC.params); }catch(e){ toast("式エラー: "+e.message); return; } }
   const cat=$("mCat").value.trim(); if(!cat){ toast("科目を入れてください"); return; }
+  // 同じ科目の既存明細の中央値と桁が違う（10倍以上・1/10以下）なら確認。件数0なら見ない
+  if(!expr&&amtRaw!==""){
+    const amt=Math.abs(Math.round(+amtRaw));
+    const same=DB.details.filter(x=>x.cat===cat&&x.id!==(EDIT_ID||"")&&!x.expr&&x.amount!=null&&Math.abs(+x.amount)>0).map(x=>Math.abs(+x.amount)).sort((a,b)=>a-b);
+    if(same.length&&amt>0){
+      const med=same.length%2?same[(same.length-1)/2]:Math.round((same[same.length/2-1]+same[same.length/2])/2);
+      if(med>0&&(amt>=med*10||amt<=med/10)&&!confirm("同じ科目の通常額は約"+yen0(med)+"円です（今回 "+yen0(amt)+"円）。桁を確認してください。このまま反映しますか？")) return;
+    }
+  }
   const row={id:EDIT_ID||("n"+Date.now().toString(36)),date,kubun:$("mKubun").value,cat,name:$("mName").value.trim(),amount:expr?null:Math.round(+amtRaw),expr,case:$("mCase").value,kaku:$("mKaku").value,src:$("mSrc").value.trim()};
   const i=DB.details.findIndex(x=>x.id===row.id); if(i>=0) DB.details[i]=row; else DB.details.push(row);
   PEND.ups[row.id]=row; delete PEND.dels[row.id];
@@ -755,7 +775,27 @@ function renderNotes(){ $("notes").innerHTML=(DB.notes||[]).map(n=>`<li>${esc(n)
 
 /* ===== 保存・取消 ===== */
 $("undoBtn").onclick=()=>{ if(!confirm("未保存の変更をすべて破棄しますか？")) return; PEND={params:{},ups:{},dels:{},checks:{}}; applyServer(SERVER,false); toast("元に戻しました"); };
+// 保存前に「何がどう変わるか」を見せる（前提: 旧→新、明細の件数、最低週末残高の旧→新）
+function saveSummary(){
+  const fmtP=(p,v)=>{ if(v==null||v==="") return "（空）"; if(p.type==="率") return (+v*100).toFixed(1).replace(/\.0$/,"")+"%"; if(p.type==="数値") return yen0(+v)+"円"; return String(v); };
+  const lines=[];
+  Object.keys(PEND.params).forEach(k=>{ const p=DB.params.find(x=>x.key===k)||{key:k}; const o=(SERVER.db.params.find(x=>x.key===k)||{}).value; lines.push("・"+(p.label||k)+": "+fmtP(p,o)+" → "+fmtP(p,p.value)); });
+  const u=Object.keys(PEND.ups).length, dl=Object.keys(PEND.dels).length, ck=Object.keys(PEND.checks).length;
+  if(u||dl) lines.push("・明細: 追加/変更 "+u+"件・削除 "+dl+"件");
+  if(ck) lines.push("・要確認: "+ck+"件");
+  try{
+    const oldC=SERVER.calc||SGCalc.compute(clone(SERVER.db));
+    const os=oldC.scenarios[SC]&&oldC.scenarios[SC].summary, ns=CALC.scenarios[SC]&&CALC.scenarios[SC].summary;
+    if(os&&ns&&isFinite(os.minEnd)&&isFinite(ns.minEnd)) lines.push("・最低週末残高（"+CALC.scenarios[SC].name+"）: "+yen0(os.minEnd)+"円 → "+yen0(ns.minEnd)+"円"+(os.minEnd===ns.minEnd?"（変わらず）":""));
+  }catch(_){}
+  return lines;
+}
 $("saveBtn").onclick=async()=>{
+  // 保存前の差分確認（サマリが作れなければ従来どおり通す）
+  if(isDirty()){
+    let lines=null; try{ lines=saveSummary(); }catch(_){ lines=null; }
+    if(lines&&lines.length&&!confirm("この内容でDBに保存します。\n\n"+lines.join("\n")+"\n\nよろしいですか？")) return;
+  }
   const c=creds(); const btn=$("saveBtn"); btn.disabled=true; btn.textContent="保存中…";
   try{
     const d=await post({action:"save",email:c.email,pass:c.pass,params:PEND.params,upserts:Object.values(PEND.ups),deletes:Object.keys(PEND.dels),checks:Object.values(PEND.checks)},1);
